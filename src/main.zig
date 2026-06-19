@@ -12,8 +12,7 @@ pub fn main() !void {
     // Benchmark: timed externally with `time`. ITERS via comptime default.
     const iters = 500;
     var acc: u8 = 0;
-    var i: usize = 0;
-    while (i < iters) : (i += 1) {
+    for (0..iters) |_| {
         const s = rsa.sign(msg);
         acc ^= s[0] ^ s[511];
     }

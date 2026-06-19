@@ -46,18 +46,18 @@ pub fn montExp(base_mont: *const Fe, exp: *const Fe, comptime P: Params, mont_on
     var table: [TABLE_SIZE]Fe = undefined;
     table[0] = base_mont.*;
     const x2 = montSqr(base_mont, P);
-    var k: usize = 1;
-    while (k < TABLE_SIZE) : (k += 1) {
+    for (1..TABLE_SIZE) |k| {
         table[k] = montMul(&table[k - 1], &x2, P);
     }
 
     // find highest set bit
     var top: isize = -1;
     {
-        var i: isize = @as(isize, @intCast(N * 64)) - 1;
-        while (i >= 0) : (i -= 1) {
-            if (bitAt(exp, @intCast(i)) == 1) {
-                top = i;
+        var li: usize = N;
+        while (li > 0) {
+            li -= 1;
+            if (exp[li] != 0) {
+                top = @intCast(li * 64 + 63 - @clz(exp[li]));
                 break;
             }
         }
@@ -77,8 +77,7 @@ pub fn montExp(base_mont: *const Fe, exp: *const Fe, comptime P: Params, mont_on
         if (l < 0) l = 0;
         while (bitAt(exp, @intCast(l)) == 0) l += 1;
         const wbits: usize = @intCast(i - l + 1);
-        var s: usize = 0;
-        while (s < wbits) : (s += 1) result = montSqr(&result, P);
+        for (0..wbits) |_| result = montSqr(&result, P);
         // extract window value (bits l..i)
         var val: usize = 0;
         var b: isize = i;
@@ -125,15 +124,8 @@ pub fn encodeMessage(msg: []const u8) [2 * N]u64 {
 
     // Convert big-endian EM into little-endian limbs.
     var out: [2 * N]u64 = @splat(0);
-    var i: usize = 0;
-    while (i < 2 * N) : (i += 1) {
-        var limb: u64 = 0;
-        var b: usize = 0;
-        while (b < 8) : (b += 1) {
-            const byte_idx = K - 1 - (i * 8 + b);
-            limb |= @as(u64, em[byte_idx]) << @intCast(b * 8);
-        }
-        out[i] = limb;
+    for (0..2 * N) |i| {
+        out[i] = std.mem.readInt(u64, em[K - 8 * (i + 1) ..][0..8], .big);
     }
     return out;
 }
@@ -143,8 +135,7 @@ fn buildTable(base: *const Fe, comptime P: Params, mont_one: *const Fe) [simd.NW
     var t64: [simd.NW]Fe = undefined;
     t64[0] = mont_one.*;
     t64[1] = base.*;
-    var k: usize = 2;
-    while (k < simd.NW) : (k += 1) t64[k] = montMul(&t64[k - 1], base, P);
+    for (2..simd.NW) |k| t64[k] = montMul(&t64[k - 1], base, P);
     var t32: [simd.NW][simd.N32]u32 = undefined;
     for (0..simd.NW) |i| t32[i] = simd.split32(&t64[i]);
     return t32;
@@ -185,18 +176,18 @@ pub fn sign(msg: []const u8) [K]u8 {
     var sq_modp = sq;
     bi.condSub(&sq_modp, key.p); // sq mod p
     const diff = bi.subMod(&sp, &sq_modp, key.p);
-    const h = bi.montMul(&diff, &key.qinv_mont, key.p, key.p_n0inv); // diff*qinv mod p
+    const h = montMul(&diff, &key.qinv_mont, P_params); // diff*qinv mod p
 
     // s = sq + q*h  (full 2N-limb result)
     const qh = bi.mulFull(&key.q, &h);
     var s: [2 * N]u64 = qh;
     var carry: u128 = 0;
-    var i: usize = 0;
-    while (i < N) : (i += 1) {
+    for (0..N) |i| {
         const t = @as(u128, s[i]) + @as(u128, sq[i]) + carry;
         s[i] = @truncate(t);
         carry = t >> 64;
     }
+    var i: usize = N;
     while (i < 2 * N and carry != 0) : (i += 1) {
         const t = @as(u128, s[i]) + carry;
         s[i] = @truncate(t);
@@ -205,12 +196,8 @@ pub fn sign(msg: []const u8) [K]u8 {
 
     // I2OSP: little-endian limbs -> big-endian bytes
     var sig: [K]u8 = undefined;
-    i = 0;
-    while (i < 2 * N) : (i += 1) {
-        var b: usize = 0;
-        while (b < 8) : (b += 1) {
-            sig[K - 1 - (i * 8 + b)] = @truncate(s[i] >> @intCast(b * 8));
-        }
+    for (0..2 * N) |j| {
+        std.mem.writeInt(u64, sig[K - 8 * (j + 1) ..][0..8], s[j], .big);
     }
     return sig;
 }

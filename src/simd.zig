@@ -47,8 +47,7 @@ pub fn montMulV(a: *const Batched, b: *const Batched) Batched {
     @setEvalBranchQuota(50000);
     var t: [N32]W = @splat(WZERO); // per-column accumulator, < 2^32 between i steps
     var tn: W = WZERO;
-    var i: usize = 0;
-    while (i < N32) : (i += 1) {
+    for (0..N32) |i| {
         const a4 = bcast(col(a, i));
         // t += a[i] * b
         var c: W = WZERO;
@@ -93,8 +92,7 @@ pub fn montMulV(a: *const Batched, b: *const Batched) Batched {
     // Per-lane conditional subtraction of the modulus.
     var diff: [N32]W = undefined;
     var borrow: W = WZERO;
-    var k: usize = 0;
-    while (k < N32) : (k += 1) {
+    for (0..N32) |k| {
         const mk: L = col(&modP, k);
         const d = (t[k] -% @as(W, mk)) -% borrow;
         diff[k] = d & MASK;
@@ -102,8 +100,7 @@ pub fn montMulV(a: *const Batched, b: *const Batched) Batched {
     }
     const sub = (tn != WZERO) | (borrow == WZERO);
     var r: Batched = undefined;
-    k = 0;
-    while (k < NP) : (k += 1) {
+    for (0..NP) |k| {
         const lo: L = @truncate(@select(u64, sub, diff[2 * k], t[2 * k]));
         const hi: L = @truncate(@select(u64, sub, diff[2 * k + 1], t[2 * k + 1]));
         r[k] = .{ lo[0], lo[1], hi[0], hi[1] };
