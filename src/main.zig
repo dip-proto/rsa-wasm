@@ -1,5 +1,6 @@
 const std = @import("std");
 const rsa = @import("rsa.zig");
+const bench = @import("bench.zig");
 
 pub fn main() !void {
     const msg = "hello rsa wasm benchmark message";
@@ -9,12 +10,12 @@ pub fn main() !void {
     const hex = std.fmt.bytesToHex(sig, .lower);
     std.debug.print("sig={s}\n", .{hex});
 
-    // Benchmark: timed externally with `time`. ITERS via comptime default.
-    const iters = 500;
+    // Benchmark: the loop count is fixed at build time (-Diters). Timing two
+    // counts and subtracting cancels all fixed overhead.
     var acc: u8 = 0;
-    for (0..iters) |_| {
+    for (0..bench.iters) |_| {
         const s = rsa.sign(msg);
         acc ^= s[0] ^ s[511];
     }
-    std.debug.print("iters={d} acc={d}\n", .{ iters, acc });
+    std.debug.print("iters={d} acc={d}\n", .{ bench.iters, acc });
 }

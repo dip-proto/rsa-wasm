@@ -10,14 +10,26 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{ .default_target = default_query });
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode (default ReleaseFast)") orelse .ReleaseFast;
 
+    // -Druntime_key=true builds the variant whose key is parsed at runtime (the
+    // modulus is opaque to the optimizer), instead of the comptime-baked key.
+    const runtime_key = b.option(bool, "runtime_key", "Build the runtime-key variant") orelse false;
+    const root_src = if (runtime_key) "src/main_rt.zig" else "src/main.zig";
+
+    const iters = b.option(usize, "iters", "Signatures per benchmark run (default 500)") orelse 500;
+    const bench_opts = b.addOptions();
+    bench_opts.addOption(usize, "iters", iters);
+
+    const root_mod = b.createModule(.{
+        .root_source_file = b.path(root_src),
+        .target = target,
+        .optimize = optimize,
+        .strip = true,
+    });
+    root_mod.addOptions("build_options", bench_opts);
+
     const exe = b.addExecutable(.{
         .name = "rsa",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = true,
-        }),
+        .root_module = root_mod,
     });
     b.installArtifact(exe);
 
@@ -47,8 +59,16 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const tests_rt = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/rsa_rt.zig"),
+            .target = b.resolveTargetQuery(.{}), // native
+            .optimize = optimize,
+        }),
+    });
     const test_step = b.step("test", "Run correctness tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+    test_step.dependOn(&b.addRunArtifact(tests_rt).step);
 
     const run_step = b.step("run", "Run the app (under the host or a wasm runtime)");
     const run_cmd = b.addRunArtifact(exe);
