@@ -34,17 +34,3 @@ the spread between implementations, and here it is far wider.
 | Rust `rsa` 0.9.10 wasm     | 106.57  | 39.2× slower      |
 | Rust `rsa` 0.10 wasm       | 106.57  | 39.2× slower      |
 
-## Comptime key vs. runtime key
-
-The numbers above bake the signing key into the binary at compile time, so the
-modulus limbs become immediates in the Montgomery loops. Building with
-`-Druntime_key=true` instead parses the key from its hex form at startup and
-passes it to `sign()` as an ordinary argument, the same way the
-message is: the modulus is then opaque to the optimizer.
-
-| key form    | wasm ms/sign |
-| ----------- | ------------ |
-| comptime    | 3.23         |
-| runtime arg | 3.34         |
-
-A runtime modulus costs about 3-4% on wasm and nothing measurable on native.

@@ -51,7 +51,7 @@ pub inline fn geq(a: *const Fe, b: *const Fe) bool {
     return true;
 }
 
-inline fn subInPlace(a: *Fe, comptime m: Fe) void {
+inline fn subInPlace(a: *Fe, m: *const Fe) void {
     var borrow: Wide = 0;
     inline for (0..N) |i| {
         const d = @as(Wide, a[i]) -% @as(Wide, m[i]) -% borrow;
@@ -60,11 +60,11 @@ inline fn subInPlace(a: *Fe, comptime m: Fe) void {
     }
 }
 
-pub inline fn condSub(a: *Fe, comptime m: Fe) void {
-    if (geq(a, &m)) subInPlace(a, m);
+pub inline fn condSub(a: *Fe, m: *const Fe) void {
+    if (geq(a, m)) subInPlace(a, m);
 }
 
-pub inline fn addModNoMont(a: *const Fe, b: *const Fe, comptime m: Fe) Fe {
+pub inline fn addModNoMont(a: *const Fe, b: *const Fe, m: *const Fe) Fe {
     var r: Fe = undefined;
     var carry: Limb = 0;
     inline for (0..N) |i| {
@@ -74,11 +74,11 @@ pub inline fn addModNoMont(a: *const Fe, b: *const Fe, comptime m: Fe) Fe {
     }
     // Sum may be N+1 limbs (carry out). value = carry*R + r < 2m, so subtract
     // m when there is a carry OR the low part already exceeds m.
-    if (carry != 0 or geq(&r, &m)) subInPlace(&r, m);
+    if (carry != 0 or geq(&r, m)) subInPlace(&r, m);
     return r;
 }
 
-pub inline fn subMod(a: *const Fe, b: *const Fe, comptime m: Fe) Fe {
+pub inline fn subMod(a: *const Fe, b: *const Fe, m: *const Fe) Fe {
     var r: Fe = undefined;
     var borrow: Wide = 0;
     inline for (0..N) |i| {
@@ -98,7 +98,7 @@ pub inline fn subMod(a: *const Fe, b: *const Fe, comptime m: Fe) Fe {
 }
 
 // CIOS Montgomery multiplication: returns a*b*R^{-1} mod m, with R = 2^(64*N).
-pub fn montMul(a: *const Fe, b: *const Fe, comptime m: Fe, comptime n0inv: Limb) Fe {
+pub fn montMul(a: *const Fe, b: *const Fe, m: *const Fe, n0inv: Limb) Fe {
     @setEvalBranchQuota(20000);
     var t: [N + 1]Limb = @splat(0);
     var tn: Limb = 0; // t[N]
@@ -128,7 +128,7 @@ pub fn montMul(a: *const Fe, b: *const Fe, comptime m: Fe, comptime n0inv: Limb)
     }
     var r: Fe = t[0..N].*;
     // result < 2m; one conditional subtraction (tn is 0 or 1)
-    if (tn != 0 or geq(&r, &m)) subInPlace(&r, m);
+    if (tn != 0 or geq(&r, m)) subInPlace(&r, m);
     return r;
 }
 
@@ -168,7 +168,8 @@ pub fn sqrFull(a: *const Fe) [2 * N]Limb {
 }
 
 // Montgomery reduction of a 2N-limb value: returns T * R^{-1} mod m in [0, m).
-pub fn redc(tin: *const [2 * N]Limb, comptime m: Fe, comptime n0inv: Limb) Fe {
+pub fn redc(tin: *const [2 * N]Limb, m: *const Fe, n0inv: Limb) Fe {
+    @setEvalBranchQuota(20000);
     var t: [2 * N + 1]Limb = undefined;
     @memcpy(t[0 .. 2 * N], tin);
     t[2 * N] = 0;
@@ -189,121 +190,13 @@ pub fn redc(tin: *const [2 * N]Limb, comptime m: Fe, comptime n0inv: Limb) Fe {
         }
     }
     var r: Fe = t[N .. 2 * N].*;
-    if (t[2 * N] != 0 or geq(&r, &m)) subInPlace(&r, m);
+    if (t[2 * N] != 0 or geq(&r, m)) subInPlace(&r, m);
     return r;
 }
 
-pub inline fn montSqr(a: *const Fe, comptime m: Fe, comptime n0inv: Limb) Fe {
+pub inline fn montSqr(a: *const Fe, m: *const Fe, n0inv: Limb) Fe {
     const s = sqrFull(a);
     return redc(&s, m, n0inv);
-}
-
-// ---- runtime-modulus variants ----
-// Identical math to the comptime functions above, but the modulus and n0inv are
-// ordinary runtime arguments. Used by the runtime-key benchmark, where the key
-// is not known at compile time so the optimizer cannot bake it into the loops.
-
-inline fn subInPlaceRt(a: *Fe, m: *const Fe) void {
-    var borrow: Wide = 0;
-    inline for (0..N) |i| {
-        const d = @as(Wide, a[i]) -% @as(Wide, m[i]) -% borrow;
-        a[i] = @truncate(d);
-        borrow = (d >> 64) & 1;
-    }
-}
-
-pub inline fn condSubRt(a: *Fe, m: *const Fe) void {
-    if (geq(a, m)) subInPlaceRt(a, m);
-}
-
-pub inline fn addModNoMontRt(a: *const Fe, b: *const Fe, m: *const Fe) Fe {
-    var r: Fe = undefined;
-    var carry: Limb = 0;
-    inline for (0..N) |i| {
-        const s = @as(Wide, a[i]) + @as(Wide, b[i]) + @as(Wide, carry);
-        r[i] = @truncate(s);
-        carry = @intCast(s >> 64);
-    }
-    if (carry != 0 or geq(&r, m)) subInPlaceRt(&r, m);
-    return r;
-}
-
-pub inline fn subModRt(a: *const Fe, b: *const Fe, m: *const Fe) Fe {
-    var r: Fe = undefined;
-    var borrow: Wide = 0;
-    inline for (0..N) |i| {
-        const d = @as(Wide, a[i]) -% @as(Wide, b[i]) -% borrow;
-        r[i] = @truncate(d);
-        borrow = (d >> 64) & 1;
-    }
-    if (borrow != 0) {
-        var carry: Wide = 0;
-        inline for (0..N) |i| {
-            const s = @as(Wide, r[i]) + @as(Wide, m[i]) + carry;
-            r[i] = @truncate(s);
-            carry = s >> 64;
-        }
-    }
-    return r;
-}
-
-pub fn montMulRt(a: *const Fe, b: *const Fe, m: *const Fe, n0inv: Limb) Fe {
-    var t: [N + 1]Limb = @splat(0);
-    var tn: Limb = 0;
-    for (0..N) |i| {
-        const ai = a[i];
-        var c: Limb = 0;
-        inline for (0..N) |j| {
-            const prod = mulWide(ai, b[j]) + @as(Wide, t[j]) + @as(Wide, c);
-            t[j] = @truncate(prod);
-            c = @intCast(prod >> 64);
-        }
-        const s0 = @as(Wide, tn) + @as(Wide, c);
-        const tcarry: Limb = @intCast(s0 >> 64);
-
-        const mh: Limb = t[0] *% n0inv;
-        var c2: Limb = @intCast((mulWide(mh, m[0]) + @as(Wide, t[0])) >> 64);
-        inline for (1..N) |j| {
-            const prod = mulWide(mh, m[j]) + @as(Wide, t[j]) + @as(Wide, c2);
-            t[j - 1] = @truncate(prod);
-            c2 = @intCast(prod >> 64);
-        }
-        const s1 = @as(Wide, @as(Limb, @truncate(s0))) + @as(Wide, c2);
-        t[N - 1] = @truncate(s1);
-        tn = tcarry + @as(Limb, @intCast(s1 >> 64));
-    }
-    var r: Fe = t[0..N].*;
-    if (tn != 0 or geq(&r, m)) subInPlaceRt(&r, m);
-    return r;
-}
-
-pub fn redcRt(tin: *const [2 * N]Limb, m: *const Fe, n0inv: Limb) Fe {
-    var t: [2 * N + 1]Limb = undefined;
-    @memcpy(t[0 .. 2 * N], tin);
-    t[2 * N] = 0;
-    for (0..N) |i| {
-        const mh: Limb = t[i] *% n0inv;
-        var c: Limb = 0;
-        inline for (0..N) |j| {
-            const prod = mulWide(mh, m[j]) + @as(Wide, t[i + j]) + @as(Wide, c);
-            t[i + j] = @truncate(prod);
-            c = @intCast(prod >> 64);
-        }
-        var k: usize = i + N;
-        while (c != 0) : (k += 1) {
-            const s = @as(Wide, t[k]) + @as(Wide, c);
-            t[k] = @truncate(s);
-            c = @intCast(s >> 64);
-        }
-    }
-    var r: Fe = t[N .. 2 * N].*;
-    if (t[2 * N] != 0 or geq(&r, m)) subInPlaceRt(&r, m);
-    return r;
-}
-
-pub inline fn montSqrRt(a: *const Fe, m: *const Fe, n0inv: Limb) Fe {
-    const s = sqrFull(a);
-    return redcRt(&s, m, n0inv);
 }
 
 // Full schoolbook multiply: (a[N]) * (b[N]) -> r[2N]
