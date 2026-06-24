@@ -3,7 +3,7 @@ const bi = @import("bigint.zig");
 
 // -m^-1 mod 2^64 via Newton's iteration (doubles correct bits each step). The
 // limb width is fixed, so this does not depend on the modulus size.
-fn negInv64(m0: u64) u64 {
+pub fn negInv64(m0: u64) u64 {
     var x: u64 = 1;
     inline for (0..6) |_| x = x *% (2 -% m0 *% x);
     return 0 -% x;
@@ -53,6 +53,44 @@ pub fn Key(comptime N: usize) type {
                 // qinv * R mod p = montMul(qinv, R^2) since montMul folds in one R^-1.
                 .qinv_mont = B.montMul(&qinv, &p_rr, &p, negInv64(p[0])),
             };
+        }
+
+        // Same as fromHex but the components arrive as raw big-endian bytes
+        pub fn fromBytes(
+            p_be: []const u8,
+            q_be: []const u8,
+            dp_be: []const u8,
+            dq_be: []const u8,
+            qinv_be: []const u8,
+        ) !Self {
+            const p = try bytesToFe(p_be);
+            const q = try bytesToFe(q_be);
+            const p_rr = computeRR(&p);
+            const q_rr = computeRR(&q);
+            const qinv = try bytesToFe(qinv_be);
+            return .{
+                .p = p,
+                .q = q,
+                .p_exp = try bytesToFe(dp_be),
+                .q_exp = try bytesToFe(dq_be),
+                .p_n0inv = negInv64(p[0]),
+                .q_n0inv = negInv64(q[0]),
+                .p_rr = p_rr,
+                .q_rr = q_rr,
+                .qinv_mont = B.montMul(&qinv, &p_rr, &p, negInv64(p[0])),
+            };
+        }
+
+        // Big-endian bytes (up to N limbs) into little-endian 64-bit limbs.
+        fn bytesToFe(be: []const u8) !Fe {
+            if (be.len > 8 * N) return error.KeyTooLong;
+            var bytes: [8 * N]u8 = @splat(0);
+            @memcpy(bytes[8 * N - be.len ..], be);
+            var fe: Fe = @splat(0);
+            for (0..N) |i| {
+                fe[i] = std.mem.readInt(u64, bytes[8 * N - 8 * (i + 1) ..][0..8], .big);
+            }
+            return fe;
         }
 
         // Big-endian hex (up to N limbs) into little-endian 64-bit limbs.

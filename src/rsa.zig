@@ -171,7 +171,78 @@ pub fn Rsa(comptime modulus_bits: usize) type {
             }
             return sig;
         }
+
+        // Verify a PKCS#1 v1.5 + SHA-256 signature against the public key (n, e).
+        // The public operation s^e mod n runs over the full 2N-limb modulus, so it
+        // gets its own BigInt instance separate from the CRT half-width signing
+        // path. e is small (typically 65537), so a plain square-and-multiply over
+        // its bits is enough; verification is not on the hot path.
+        pub fn verify(n_be: []const u8, e: u64, msg: []const u8, sig: []const u8) bool {
+            const M = bi.BigInt(2 * N);
+            if (sig.len != K or n_be.len > K or e == 0) return false;
+
+            const n = beToLimbs(2 * N, n_be);
+            if (n[0] & 1 == 0) return false; // RSA modulus is odd
+            var s = beToLimbs(2 * N, sig);
+            if (M.geq(&s, &n)) return false; // signature must be in [0, n)
+
+            const n0inv = key.negInv64(n[0]);
+            const rr = montRR(2 * N, &n);
+            var one: M.Fe = @splat(0);
+            one[0] = 1;
+
+            const base_mont = M.montMul(&s, &rr, &n, n0inv); // s -> Montgomery domain
+            var result = M.montMul(&one, &rr, &n, n0inv); // 1 -> Montgomery domain
+            var bit: isize = 63 - @as(isize, @clz(e));
+            while (bit >= 0) : (bit -= 1) {
+                result = M.montSqr(&result, &n, n0inv);
+                if ((e >> @intCast(bit)) & 1 == 1) {
+                    result = M.montMul(&result, &base_mont, &n, n0inv);
+                }
+            }
+            const recovered = M.montMul(&result, &one, &n, n0inv); // leave Montgomery domain
+
+            const em = encodeMessage(msg);
+            var diff: u64 = 0;
+            for (0..2 * N) |i| diff |= recovered[i] ^ em[i];
+            return diff == 0;
+        }
     };
+}
+
+// Big-endian bytes (at most L limbs wide) into little-endian 64-bit limbs.
+fn beToLimbs(comptime L: usize, be: []const u8) [L]u64 {
+    var bytes: [8 * L]u8 = @splat(0);
+    @memcpy(bytes[8 * L - be.len ..], be);
+    var fe: [L]u64 = @splat(0);
+    for (0..L) |i| {
+        fe[i] = std.mem.readInt(u64, bytes[8 * L - 8 * (i + 1) ..][0..8], .big);
+    }
+    return fe;
+}
+
+// R^2 mod m with R = 2^(64*L): start at 1 and double mod m 2*64*L times.
+fn montRR(comptime L: usize, m: *const [L]u64) [L]u64 {
+    const M = bi.BigInt(L);
+    var acc: [L]u64 = @splat(0);
+    acc[0] = 1;
+    for (0..2 * 64 * L) |_| {
+        var carry: u64 = 0;
+        for (0..L) |i| {
+            const nc = acc[i] >> 63;
+            acc[i] = (acc[i] << 1) | carry;
+            carry = nc;
+        }
+        if (carry != 0 or M.geq(&acc, m)) {
+            var borrow: u128 = 0;
+            for (0..L) |i| {
+                const d = @as(u128, acc[i]) -% @as(u128, m[i]) -% borrow;
+                acc[i] = @truncate(d);
+                borrow = (d >> 64) & 1;
+            }
+        }
+    }
+    return acc;
 }
 
 pub const Rsa2048 = Rsa(2048);
@@ -196,4 +267,43 @@ test "RSA-3072 sign matches the OpenSSL reference signature" {
 
 test "RSA-4096 sign matches the OpenSSL reference signature" {
     try expectReferenceSignature(Rsa4096, key.default4096);
+}
+
+fn expectReferenceVerify(comptime R: type, comptime d: type) !void {
+    const N = R.modulus_bits_ / 128;
+    const B = bi.BigInt(N);
+    const K = R.signature_len;
+    const k = try R.Key.fromHex(d.p_hex, d.q_hex, d.dp_hex, d.dq_hex, d.qinv_hex);
+
+    // n = p * q, little-endian limbs -> big-endian bytes.
+    const n_limbs = B.mulFull(&k.p, &k.q);
+    var n_be: [K]u8 = undefined;
+    for (0..2 * N) |j| {
+        std.mem.writeInt(u64, n_be[K - 8 * (j + 1) ..][0..8], n_limbs[j], .big);
+    }
+
+    const msg = "hello rsa wasm benchmark message";
+    var sig: [K]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&sig, d.sig_hex);
+    try std.testing.expect(R.verify(&n_be, 65537, msg, &sig));
+
+    // A flipped signature bit must be rejected.
+    sig[K - 1] ^= 1;
+    try std.testing.expect(!R.verify(&n_be, 65537, msg, &sig));
+    sig[K - 1] ^= 1;
+
+    // A changed message must be rejected.
+    try std.testing.expect(!R.verify(&n_be, 65537, "hello rsa wasm benchmark messagf", &sig));
+}
+
+test "RSA-2048 verify accepts the reference signature and rejects tampering" {
+    try expectReferenceVerify(Rsa2048, key.default2048);
+}
+
+test "RSA-3072 verify accepts the reference signature and rejects tampering" {
+    try expectReferenceVerify(Rsa3072, key.default3072);
+}
+
+test "RSA-4096 verify accepts the reference signature and rejects tampering" {
+    try expectReferenceVerify(Rsa4096, key.default4096);
 }
