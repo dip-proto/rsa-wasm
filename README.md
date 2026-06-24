@@ -5,6 +5,12 @@ PKCS#1 v1.5 signatures over SHA-256 with a 4096-bit key. Every implementation
 produces the same signature bytes; the only thing that varies is how fast it
 gets there. The Wasm rows run under Wasmtime with precompiled modules.
 
+The signer is parametric over the modulus size: 2048, 3072 and 4096 bits all
+work, selected at build time with `-Dbits=N` (default 4096). The size is a
+comptime parameter, so each build is fully specialized — the 4096-bit path
+compiles to exactly the same code it did before the other sizes existed. The
+benchmark numbers below are all for the 4096-bit key.
+
 ## Apple Silicon M5 (aarch64)
 
 | Implementation                | ms/sign | vs OpenSSL native |

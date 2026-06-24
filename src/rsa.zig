@@ -2,171 +2,198 @@ const std = @import("std");
 const bi = @import("bigint.zig");
 const key = @import("key.zig");
 
-const Fe = bi.Fe;
-const N = bi.N;
-pub const Key = key.Key;
-
-const K = 512; // modulus bytes (4096 bits)
-
 // PKCS#1 v1.5 DigestInfo prefix for SHA-256.
 const sha256_prefix = [_]u8{
     0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
     0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
 };
 
-// Build the PKCS#1 v1.5 padded message as a 2N-limb little-endian integer.
-fn encodeMessage(msg: []const u8) [2 * N]u64 {
-    var em: [K]u8 = undefined;
-    em[0] = 0x00;
-    em[1] = 0x01;
-    const tlen = sha256_prefix.len + 32;
-    const ps_len = K - 3 - tlen;
-    @memset(em[2 .. 2 + ps_len], 0xff);
-    em[2 + ps_len] = 0x00;
-    @memcpy(em[3 + ps_len ..][0..sha256_prefix.len], &sha256_prefix);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(msg, &digest, .{});
-    @memcpy(em[3 + ps_len + sha256_prefix.len ..][0..32], &digest);
-
-    // Convert big-endian EM into little-endian limbs.
-    var out: [2 * N]u64 = @splat(0);
-    for (0..2 * N) |i| {
-        out[i] = std.mem.readInt(u64, em[K - 8 * (i + 1) ..][0..8], .big);
-    }
-    return out;
-}
-
-// Reduce a full 2N-limb value into Montgomery form mod m: returns (M mod m)*R mod m.
-fn reduceToMont(full: *const [2 * N]u64, m: *const Fe, n0inv: u64, rr: *const Fe) Fe {
-    var mlo: Fe = full[0..N].*;
-    var mhi: Fe = full[N .. 2 * N].*;
-    bi.condSub(&mlo, m); // each half < R < 2m, one subtraction reduces mod m
-    bi.condSub(&mhi, m);
-    const tlo = bi.montMul(&mlo, rr, m, n0inv); // mlo * R mod m
-    const thi = bi.montMul(&mhi, rr, m, n0inv); // mhi * R mod m
-    const thiR = bi.montMul(&thi, rr, m, n0inv); // mhi * R^2 mod m
-    return bi.addModNoMont(&thiR, &tlo, m);
-}
-
-inline fn bitAt(exp: *const Fe, idx: usize) u1 {
-    return @truncate(exp[idx >> 6] >> @intCast(idx & 63));
-}
-
 const WINDOW = 7;
 const TABLE_SIZE = 1 << (WINDOW - 1); // odd powers x^1, x^3, ... x^(2^w-1)
 
-// Montgomery exponentiation with sliding window. base_mont is in Montgomery domain.
-fn montExp(base_mont: *const Fe, exp: *const Fe, m: *const Fe, n0inv: u64, mont_one: *const Fe) Fe {
-    var table: [TABLE_SIZE]Fe = undefined;
-    table[0] = base_mont.*;
-    const x2 = bi.montSqr(base_mont, m, n0inv);
-    for (1..TABLE_SIZE) |k| {
-        table[k] = bi.montMul(&table[k - 1], &x2, m, n0inv);
-    }
+// PKCS#1 v1.5 + SHA-256 RSA signing for a given modulus size, specialized at
+// comptime. `modulus_bits` is 2048, 3072 or 4096; the CRT primes are half that
+// width, so the limb arithmetic runs on N = modulus_bits/128 limbs. With every
+// size a compile-time constant, RSA-4096 lowers to exactly the same code it did
+// before this became parametric.
+pub fn Rsa(comptime modulus_bits: usize) type {
+    if (modulus_bits % 128 != 0) @compileError("modulus_bits must be a multiple of 128");
+    const N = modulus_bits / 128; // limbs per CRT prime
+    const K = modulus_bits / 8; // modulus bytes
+    const B = bi.BigInt(N);
+    const Fe = B.Fe;
 
-    // find highest set bit
-    var top: isize = -1;
-    {
-        var li: usize = N;
-        while (li > 0) {
-            li -= 1;
-            if (exp[li] != 0) {
-                top = @intCast(li * 64 + 63 - @clz(exp[li]));
-                break;
+    return struct {
+        pub const Key = key.Key(N);
+        pub const modulus_bits_ = modulus_bits;
+        pub const signature_len = K;
+
+        // Build the PKCS#1 v1.5 padded message as a 2N-limb little-endian integer.
+        fn encodeMessage(msg: []const u8) [2 * N]u64 {
+            var em: [K]u8 = undefined;
+            em[0] = 0x00;
+            em[1] = 0x01;
+            const tlen = sha256_prefix.len + 32;
+            const ps_len = K - 3 - tlen;
+            @memset(em[2 .. 2 + ps_len], 0xff);
+            em[2 + ps_len] = 0x00;
+            @memcpy(em[3 + ps_len ..][0..sha256_prefix.len], &sha256_prefix);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(msg, &digest, .{});
+            @memcpy(em[3 + ps_len + sha256_prefix.len ..][0..32], &digest);
+
+            // Convert big-endian EM into little-endian limbs.
+            var out: [2 * N]u64 = @splat(0);
+            for (0..2 * N) |i| {
+                out[i] = std.mem.readInt(u64, em[K - 8 * (i + 1) ..][0..8], .big);
             }
+            return out;
         }
-    }
-    if (top < 0) return mont_one.*;
 
-    var result = mont_one.*;
-    var i: isize = top;
-    while (i >= 0) {
-        if (bitAt(exp, @intCast(i)) == 0) {
-            result = bi.montSqr(&result, m, n0inv);
-            i -= 1;
-            continue;
+        // Reduce a full 2N-limb value into Montgomery form mod m: returns (M mod m)*R mod m.
+        fn reduceToMont(full: *const [2 * N]u64, m: *const Fe, n0inv: u64, rr: *const Fe) Fe {
+            var mlo: Fe = full[0..N].*;
+            var mhi: Fe = full[N .. 2 * N].*;
+            B.condSub(&mlo, m); // each half < R < 2m, one subtraction reduces mod m
+            B.condSub(&mhi, m);
+            const tlo = B.montMul(&mlo, rr, m, n0inv); // mlo * R mod m
+            const thi = B.montMul(&mhi, rr, m, n0inv); // mhi * R mod m
+            const thiR = B.montMul(&thi, rr, m, n0inv); // mhi * R^2 mod m
+            return B.addModNoMont(&thiR, &tlo, m);
         }
-        // sliding window: find lowest index l >= i-WINDOW+1 with a set bit
-        var l: isize = i - WINDOW + 1;
-        if (l < 0) l = 0;
-        while (bitAt(exp, @intCast(l)) == 0) l += 1;
-        const wbits: usize = @intCast(i - l + 1);
-        for (0..wbits) |_| result = bi.montSqr(&result, m, n0inv);
-        // extract window value (bits l..i)
-        var val: usize = 0;
-        var b: isize = i;
-        while (b >= l) : (b -= 1) {
-            val = (val << 1) | bitAt(exp, @intCast(b));
+
+        inline fn bitAt(exp: *const Fe, idx: usize) u1 {
+            return @truncate(exp[idx >> 6] >> @intCast(idx & 63));
         }
-        result = bi.montMul(&result, &table[(val - 1) >> 1], m, n0inv);
-        i = l - 1;
-    }
-    return result;
+
+        // Montgomery exponentiation with sliding window. base_mont is in Montgomery domain.
+        fn montExp(base_mont: *const Fe, exp: *const Fe, m: *const Fe, n0inv: u64, mont_one: *const Fe) Fe {
+            var table: [TABLE_SIZE]Fe = undefined;
+            table[0] = base_mont.*;
+            const x2 = B.montSqr(base_mont, m, n0inv);
+            for (1..TABLE_SIZE) |k| {
+                table[k] = B.montMul(&table[k - 1], &x2, m, n0inv);
+            }
+
+            // find highest set bit
+            var top: isize = -1;
+            {
+                var li: usize = N;
+                while (li > 0) {
+                    li -= 1;
+                    if (exp[li] != 0) {
+                        top = @intCast(li * 64 + 63 - @clz(exp[li]));
+                        break;
+                    }
+                }
+            }
+            if (top < 0) return mont_one.*;
+
+            var result = mont_one.*;
+            var i: isize = top;
+            while (i >= 0) {
+                if (bitAt(exp, @intCast(i)) == 0) {
+                    result = B.montSqr(&result, m, n0inv);
+                    i -= 1;
+                    continue;
+                }
+                // sliding window: find lowest index l >= i-WINDOW+1 with a set bit
+                var l: isize = i - WINDOW + 1;
+                if (l < 0) l = 0;
+                while (bitAt(exp, @intCast(l)) == 0) l += 1;
+                const wbits: usize = @intCast(i - l + 1);
+                for (0..wbits) |_| result = B.montSqr(&result, m, n0inv);
+                // extract window value (bits l..i)
+                var val: usize = 0;
+                var b: isize = i;
+                while (b >= l) : (b -= 1) {
+                    val = (val << 1) | bitAt(exp, @intCast(b));
+                }
+                result = B.montMul(&result, &table[(val - 1) >> 1], m, n0inv);
+                i = l - 1;
+            }
+            return result;
+        }
+
+        inline fn montOne(m: *const Fe, n0inv: u64, rr: *const Fe) Fe {
+            // R mod m = (1 in Montgomery domain) = montMul(1, rr)
+            var one = B.zero;
+            one[0] = 1;
+            return B.montMul(&one, rr, m, n0inv);
+        }
+
+        // Sign: returns the K-byte big-endian signature.
+        pub fn sign(k: *const Key, msg: []const u8) [K]u8 {
+            const m_full = encodeMessage(msg);
+
+            // CRT bases in Montgomery domain.
+            const base_p = reduceToMont(&m_full, &k.p, k.p_n0inv, &k.p_rr);
+            const base_q = reduceToMont(&m_full, &k.q, k.q_n0inv, &k.q_rr);
+
+            const mont_one_p = montOne(&k.p, k.p_n0inv, &k.p_rr);
+            const mont_one_q = montOne(&k.q, k.q_n0inv, &k.q_rr);
+
+            const sp_mont = montExp(&base_p, &k.p_exp, &k.p, k.p_n0inv, &mont_one_p);
+            const sq_mont = montExp(&base_q, &k.q_exp, &k.q, k.q_n0inv, &mont_one_q);
+
+            // convert out of Montgomery domain
+            var one = B.zero;
+            one[0] = 1;
+            const sp = B.montMul(&sp_mont, &one, &k.p, k.p_n0inv);
+            const sq = B.montMul(&sq_mont, &one, &k.q, k.q_n0inv);
+
+            // Garner: h = (sp - sq) * qinv mod p ; s = sq + q*h
+            var sq_modp = sq;
+            B.condSub(&sq_modp, &k.p); // sq mod p
+            const diff = B.subMod(&sp, &sq_modp, &k.p);
+            const h = B.montMul(&diff, &k.qinv_mont, &k.p, k.p_n0inv); // diff*qinv mod p
+
+            // s = sq + q*h  (full 2N-limb result)
+            const qh = B.mulFull(&k.q, &h);
+            var s: [2 * N]u64 = qh;
+            var carry: u128 = 0;
+            for (0..N) |i| {
+                const t = @as(u128, s[i]) + @as(u128, sq[i]) + carry;
+                s[i] = @truncate(t);
+                carry = t >> 64;
+            }
+            var i: usize = N;
+            while (i < 2 * N and carry != 0) : (i += 1) {
+                const t = @as(u128, s[i]) + carry;
+                s[i] = @truncate(t);
+                carry = t >> 64;
+            }
+
+            // I2OSP: little-endian limbs -> big-endian bytes
+            var sig: [K]u8 = undefined;
+            for (0..2 * N) |j| {
+                std.mem.writeInt(u64, sig[K - 8 * (j + 1) ..][0..8], s[j], .big);
+            }
+            return sig;
+        }
+    };
 }
 
-inline fn montOne(m: *const Fe, n0inv: u64, rr: *const Fe) Fe {
-    // R mod m = (1 in Montgomery domain) = montMul(1, rr)
-    var one = bi.zero();
-    one[0] = 1;
-    return bi.montMul(&one, rr, m, n0inv);
-}
+pub const Rsa2048 = Rsa(2048);
+pub const Rsa3072 = Rsa(3072);
+pub const Rsa4096 = Rsa(4096);
 
-// Sign: returns the 512-byte big-endian signature.
-pub fn sign(k: *const Key, msg: []const u8) [K]u8 {
-    const m_full = encodeMessage(msg);
-
-    // CRT bases in Montgomery domain.
-    const base_p = reduceToMont(&m_full, &k.p, k.p_n0inv, &k.p_rr);
-    const base_q = reduceToMont(&m_full, &k.q, k.q_n0inv, &k.q_rr);
-
-    const mont_one_p = montOne(&k.p, k.p_n0inv, &k.p_rr);
-    const mont_one_q = montOne(&k.q, k.q_n0inv, &k.q_rr);
-
-    const sp_mont = montExp(&base_p, &k.p_exp, &k.p, k.p_n0inv, &mont_one_p);
-    const sq_mont = montExp(&base_q, &k.q_exp, &k.q, k.q_n0inv, &mont_one_q);
-
-    // convert out of Montgomery domain
-    var one = bi.zero();
-    one[0] = 1;
-    const sp = bi.montMul(&sp_mont, &one, &k.p, k.p_n0inv);
-    const sq = bi.montMul(&sq_mont, &one, &k.q, k.q_n0inv);
-
-    // Garner: h = (sp - sq) * qinv mod p ; s = sq + q*h
-    var sq_modp = sq;
-    bi.condSub(&sq_modp, &k.p); // sq mod p
-    const diff = bi.subMod(&sp, &sq_modp, &k.p);
-    const h = bi.montMul(&diff, &k.qinv_mont, &k.p, k.p_n0inv); // diff*qinv mod p
-
-    // s = sq + q*h  (full 2N-limb result)
-    const qh = bi.mulFull(&k.q, &h);
-    var s: [2 * N]u64 = qh;
-    var carry: u128 = 0;
-    for (0..N) |i| {
-        const t = @as(u128, s[i]) + @as(u128, sq[i]) + carry;
-        s[i] = @truncate(t);
-        carry = t >> 64;
-    }
-    var i: usize = N;
-    while (i < 2 * N and carry != 0) : (i += 1) {
-        const t = @as(u128, s[i]) + carry;
-        s[i] = @truncate(t);
-        carry = t >> 64;
-    }
-
-    // I2OSP: little-endian limbs -> big-endian bytes
-    var sig: [K]u8 = undefined;
-    for (0..2 * N) |j| {
-        std.mem.writeInt(u64, sig[K - 8 * (j + 1) ..][0..8], s[j], .big);
-    }
-    return sig;
-}
-
-test "sign matches the OpenSSL reference signature" {
-    const d = key.default;
-    const k = try Key.fromHex(d.p_hex, d.q_hex, d.dp_hex, d.dq_hex, d.qinv_hex);
-    const expected_hex = "b6aa8323eea329987e604742c8d81aa146bb925bd9e3361f1c8361a0737cb75b4c9d8e370f6a2375de35fd3282c5f099d9ed42394858060a5377ebd9d0aee2cbc88a7183e82fb00f3864bf8de00137964907e28049e6cca652974f8fa15b68cf651a4ddbd6afefa7a8d2db3f6ad4f4d045bd54cf1cf668248594c1bf2c1cb34619e0e6812380abf2f456b90b74660c8bf4409b0a9aaedde63042d0cbefebefebb2c9f92b83bc82d27a39223420e18b9b44a2bf8774ae730e66cb35258b8c35f3ffcba2ed76842d7f93e9d86a0312c58a5e29d89d9a851543501b5b5c14d7b2ccbffc55c092d91229f0e3ac673b439a7e6ec8d8445d8634a4ec40e39a1f52a95d6e57e5a854d36dcc2be87ac8bd69bece3f9c65e8dd6b0210dcff35faa595c79f436cda2c36dc3d3606dcfc7917d356a92bd715acfecdaff0ec2e71585472d6e2314c6877cbf2734c0075c194864f2f0f2b33a9eb511296c669cdf8d96d2da3ba00403dff544a6c868fb3e38a95931701e9bd4eef5e869859865b2c1b5156e21af3ce0a140441bc712b429e582af78e9b79c8cabc6b38df1e54933689851011650bebdcf5d27a40d724c34c12f566d9f353c457dc23a8ec86d0e9f724068145a4eb29bb8abb93ed5de1cb26840539984c5dca2d7e85507fb7fd9a5bb72d3daa47e9d17001ae61834a54bccf9bde7ef568db13c0556817aab9d904ad95bc1107fa";
-    var expected: [K]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&expected, expected_hex);
-    const sig = sign(&k, "hello rsa wasm benchmark message");
+fn expectReferenceSignature(comptime R: type, comptime d: type) !void {
+    const k = try R.Key.fromHex(d.p_hex, d.q_hex, d.dp_hex, d.dq_hex, d.qinv_hex);
+    var expected: [R.signature_len]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, d.sig_hex);
+    const sig = R.sign(&k, "hello rsa wasm benchmark message");
     try std.testing.expectEqualSlices(u8, &expected, &sig);
+}
+
+test "RSA-2048 sign matches the OpenSSL reference signature" {
+    try expectReferenceSignature(Rsa2048, key.default2048);
+}
+
+test "RSA-3072 sign matches the OpenSSL reference signature" {
+    try expectReferenceSignature(Rsa3072, key.default3072);
+}
+
+test "RSA-4096 sign matches the OpenSSL reference signature" {
+    try expectReferenceSignature(Rsa4096, key.default4096);
 }

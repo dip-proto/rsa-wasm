@@ -11,8 +11,11 @@ pub fn build(b: *std.Build) void {
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode (default ReleaseFast)") orelse .ReleaseFast;
 
     const iters = b.option(usize, "iters", "Signatures per benchmark run (default 500)") orelse 500;
+    const bits = b.option(usize, "bits", "RSA modulus size: 2048, 3072 or 4096 (default 4096)") orelse 4096;
+    std.debug.assert(bits == 2048 or bits == 3072 or bits == 4096);
     const bench_opts = b.addOptions();
     bench_opts.addOption(usize, "iters", iters);
+    bench_opts.addOption(usize, "bits", bits);
 
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
