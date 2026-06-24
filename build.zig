@@ -3,9 +3,16 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     // Default to the goal's target: wasm32-wasi, cpu lime1+simd128+wide_arithmetic, ReleaseFast.
     // Override with -Dtarget=... / -Dcpu=... / -Doptimize=... for e.g. native tests.
+    //
+    // wide_arithmetic lets the Montgomery inner loop lower to i64.mul_wide_u instead
+    // of a __multi3 helper and is worth ~2.4x. Runtimes that do not implement the
+    // proposal cannot validate such a module; build with -Dwide-arithmetic=false to
+    // drop the feature (bigint.zig then synthesizes the product from plain i64.mul)
+    // and the artifact is named rsa_nowide so both can sit in zig-out/bin together.
+    const wide = b.option(bool, "wide-arithmetic", "Use the wasm wide-arithmetic feature (default true; set false for old runtimes)") orelse true;
     const default_query = std.Target.Query.parse(.{
         .arch_os_abi = "wasm32-wasi",
-        .cpu_features = "lime1+simd128+wide_arithmetic",
+        .cpu_features = if (wide) "lime1+simd128+wide_arithmetic" else "lime1+simd128",
     }) catch unreachable;
     const target = b.standardTargetOptions(.{ .default_target = default_query });
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode (default ReleaseFast)") orelse .ReleaseFast;
@@ -26,7 +33,7 @@ pub fn build(b: *std.Build) void {
     root_mod.addOptions("build_options", bench_opts);
 
     const exe = b.addExecutable(.{
-        .name = "rsa",
+        .name = if (wide) "rsa" else "rsa_nowide",
         .root_module = root_mod,
     });
     b.installArtifact(exe);
@@ -42,12 +49,13 @@ pub fn build(b: *std.Build) void {
         "--enable-sign-ext",
         "--enable-multivalue",
         "--enable-extended-const",
-        "--enable-wide-arithmetic",
     });
+    if (wide) wasm_opt.addArg("--enable-wide-arithmetic");
     wasm_opt.addArtifactArg(exe);
     wasm_opt.addArg("-o");
-    const opt_out = wasm_opt.addOutputFileArg("rsa.opt.wasm");
-    const install_opt = b.addInstallBinFile(opt_out, "rsa.opt.wasm");
+    const opt_name = if (wide) "rsa.opt.wasm" else "rsa_nowide.opt.wasm";
+    const opt_out = wasm_opt.addOutputFileArg(opt_name);
+    const install_opt = b.addInstallBinFile(opt_out, opt_name);
     opt_step.dependOn(&install_opt.step);
 
     const tests = b.addTest(.{
