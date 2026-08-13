@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
         .cpu_features = if (wide) "lime1+simd128+wide_arithmetic" else "lime1+simd128",
     }) catch unreachable;
     const target = b.standardTargetOptions(.{ .default_target = default_query });
-    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode (default ReleaseFast)") orelse .ReleaseFast;
+    const optimize = b.option(std.lang.Optimize, "optimize", "Optimization mode (default fast)") orelse .fast;
 
     const iters = b.option(usize, "iters", "Signatures per benchmark run (default 500)") orelse 500;
     const bits = b.option(usize, "bits", "RSA modulus size: 2048, 3072 or 4096 (default 4096)") orelse 4096;
