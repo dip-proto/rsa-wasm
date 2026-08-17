@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    // Default to the goal's target: wasm32-wasi, cpu lime1+simd128+wide_arithmetic, ReleaseFast.
+    // Default to the goal's target: wasm32-wasi, cpu lime1+simd128+wide_arithmetic, .fast.
     // Override with -Dtarget=... / -Dcpu=... / -Doptimize=... for e.g. native tests.
     //
     // wide_arithmetic lets the Montgomery inner loop lower to i64.mul_wide_u instead
