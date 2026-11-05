@@ -8,9 +8,6 @@ const sha256_prefix = [_]u8{
     0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
 };
 
-const WINDOW = 7;
-const TABLE_SIZE = 1 << (WINDOW - 1); // the table only holds odd powers
-
 // PKCS#1 v1.5 + SHA-256 signing and verification for one key size.
 pub fn Rsa(comptime modulus_bits: usize) type {
     if (modulus_bits % 128 != 0) @compileError("modulus_bits must be a multiple of 128");
@@ -19,7 +16,10 @@ pub fn Rsa(comptime modulus_bits: usize) type {
     const B = bi.BigInt(N);
     const M = bi.PublicBigInt(2 * N); // full modulus size, for verify
     const Fe = B.Fe;
-    // Window size for constant-time exponentiation: 6 bits is faster for 4096-bit keys, 5 for smaller ones.
+    // Window sizes, for the default and the constant-time exponentiation.
+    // The larger ones are faster for 4096-bit keys, the smaller ones below that.
+    const WINDOW = if (modulus_bits >= 4096) 7 else 6;
+    const TABLE_SIZE = 1 << (WINDOW - 1); // the table only holds odd powers
     const CT_WINDOW = if (modulus_bits >= 4096) 6 else 5;
 
     return struct {
