@@ -22,6 +22,8 @@ pub fn build(b: *std.Build) void {
     const bench_opts = b.addOptions();
     bench_opts.addOption(usize, "iters", iters);
     bench_opts.addOption(usize, "bits", bits);
+    const side_channels = b.option(std.crypto.SideChannelsMitigations, "side-channels-mitigations", "Side-channel mitigations (default: none). Any other level makes signing constant time") orelse .none;
+    bench_opts.addOption(std.crypto.SideChannelsMitigations, "side_channels_mitigations", side_channels);
 
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

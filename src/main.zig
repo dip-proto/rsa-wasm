@@ -3,6 +3,8 @@ const rsa = @import("rsa.zig");
 const key = @import("key.zig");
 const bench = @import("bench.zig");
 
+pub const std_options: std.Options = .{ .side_channels_mitigations = bench.side_channels_mitigations };
+
 const R = rsa.Rsa(bench.bits);
 const d = switch (bench.bits) {
     2048 => key.default2048,
