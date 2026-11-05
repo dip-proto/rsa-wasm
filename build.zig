@@ -1,20 +1,19 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    // Default to the goal's target: wasm32-wasi, cpu lime1+simd128+wide_arithmetic, .fast.
-    // Override with -Dtarget=... / -Dcpu=... / -Doptimize=... for e.g. native tests.
+    // Wide arithmetic makes signing about 2.5x faster, but not every runtime supports it yet.
+    // -Dwide-arithmetic=false builds without it, as rsa_nowide.wasm.
     //
-    // wide_arithmetic lets the Montgomery inner loop lower to i64.mul_wide_u instead
-    // of a __multi3 helper and is worth ~2.4x. Runtimes that do not implement the
-    // proposal cannot validate such a module; build with -Dwide-arithmetic=false to
-    // drop the feature (bigint.zig then synthesizes the product from plain i64.mul)
-    // and the artifact is named rsa_nowide so both can sit in zig-out/bin together.
-    const wide = b.option(bool, "wide-arithmetic", "Use the wasm wide-arithmetic feature (default true; set false for old runtimes)") orelse true;
+    // The output name and wasm-opt flags follow the CPU features actually used, so they stay right with -Dtarget or -Dcpu.
+    const wide_option = b.option(bool, "wide-arithmetic", "Use the wasm wide-arithmetic feature (default true; set false for old runtimes)");
     const default_query = std.Target.Query.parse(.{
         .arch_os_abi = "wasm32-wasi",
-        .cpu_features = if (wide) "lime1+simd128+wide_arithmetic" else "lime1+simd128",
+        .cpu_features = if (wide_option orelse true) "lime1+simd128+wide_arithmetic" else "lime1+simd128",
     }) catch unreachable;
     const target = b.standardTargetOptions(.{ .default_target = default_query });
+    const is_wasm = target.result.cpu.arch.isWasm();
+    const wide = is_wasm and std.Target.wasm.featureSetHas(target.result.cpu.features, .wide_arithmetic);
+    const name = if (is_wasm and !wide) "rsa_nowide" else "rsa";
     const optimize = b.option(std.lang.Optimize, "optimize", "Optimization mode (default fast)") orelse .fast;
 
     const iters = b.option(usize, "iters", "Signatures per benchmark run (default 500)") orelse 500;
@@ -33,30 +32,39 @@ pub fn build(b: *std.Build) void {
     root_mod.addOptions("build_options", bench_opts);
 
     const exe = b.addExecutable(.{
-        .name = if (wide) "rsa" else "rsa_nowide",
+        .name = name,
         .root_module = root_mod,
     });
+    if (wide_option) |requested| {
+        if (is_wasm and requested != wide) {
+            exe.step.dependOn(&b.addFail("-Dwide-arithmetic doesn't match the CPU features from -Dtarget/-Dcpu").step);
+        }
+    }
     b.installArtifact(exe);
 
     const opt_step = b.step("opt", "Build then run wasm-opt -O4 on the wasm");
-    const wasm_opt = b.addSystemCommand(&.{
-        "wasm-opt",
-        "-O4",
-        "--enable-simd",
-        "--enable-bulk-memory",
-        "--enable-bulk-memory-opt",
-        "--enable-nontrapping-float-to-int",
-        "--enable-sign-ext",
-        "--enable-multivalue",
-        "--enable-extended-const",
-    });
-    if (wide) wasm_opt.addArg("--enable-wide-arithmetic");
-    wasm_opt.addArtifactArg(exe);
-    wasm_opt.addArg("-o");
-    const opt_name = if (wide) "rsa.opt.wasm" else "rsa_nowide.opt.wasm";
-    const opt_out = wasm_opt.addOutputFileArg(opt_name);
-    const install_opt = b.addInstallBinFile(opt_out, opt_name);
-    opt_step.dependOn(&install_opt.step);
+    if (is_wasm) {
+        const wasm_opt = b.addSystemCommand(&.{
+            "wasm-opt",
+            "-O4",
+            "--enable-simd",
+            "--enable-bulk-memory",
+            "--enable-bulk-memory-opt",
+            "--enable-nontrapping-float-to-int",
+            "--enable-sign-ext",
+            "--enable-multivalue",
+            "--enable-extended-const",
+        });
+        if (wide) wasm_opt.addArg("--enable-wide-arithmetic");
+        wasm_opt.addArtifactArg(exe);
+        wasm_opt.addArg("-o");
+        const opt_name = b.fmt("{s}.opt.wasm", .{name});
+        const opt_out = wasm_opt.addOutputFileArg(opt_name);
+        const install_opt = b.addInstallBinFile(opt_out, opt_name);
+        opt_step.dependOn(&install_opt.step);
+    } else {
+        opt_step.dependOn(&b.addFail("the opt step only works for wasm targets").step);
+    }
 
     const tests = b.addTest(.{
         .root_module = b.createModule(.{

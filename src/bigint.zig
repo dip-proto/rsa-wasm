@@ -4,20 +4,19 @@ const builtin = @import("builtin");
 pub const Limb = u64;
 pub const Wide = u128;
 
-// 64x64 -> 128 widening multiply built from i64.mul only. The compiler otherwise
-// lowers a u128*u128 product to a __multi3 runtime call, which is fatal in the
-// Montgomery inner loop.
 const is_wasm = builtin.target.cpu.arch.isWasm();
 const has_wide_arithmetic = is_wasm and std.Target.wasm.featureSetHas(builtin.target.cpu.features, .wide_arithmetic);
 
+// 64x64 -> 128-bit product, as { low, high }.
+// Without wide arithmetic, wasm would turn this into a slow __multi3 call, so it uses mul64Portable instead.
 pub inline fn mul64(a: Limb, b: Limb) [2]Limb {
-    if (!is_wasm or has_wide_arithmetic) {
-        // Native targets and wasm wide-arithmetic can lower this directly.
-        const w = @as(Wide, a) * @as(Wide, b);
-        return .{ @truncate(w), @intCast(w >> 64) };
-    }
-    // wasm has no 64x64->128 and lowers u128*u128 to a __multi3 runtime call,
-    // so build the widening product from i64.mul only.
+    if (is_wasm and !has_wide_arithmetic) return mul64Portable(a, b);
+    const w = @as(Wide, a) * @as(Wide, b);
+    return .{ @truncate(w), @intCast(w >> 64) };
+}
+
+// Same thing, using only regular 64-bit multiplies.
+inline fn mul64Portable(a: Limb, b: Limb) [2]Limb {
     const a0: Limb = a & 0xffff_ffff;
     const a1: Limb = a >> 32;
     const b0: Limb = b & 0xffff_ffff;
@@ -36,16 +35,12 @@ pub inline fn mulWide(a: Limb, b: Limb) Wide {
     return (@as(Wide, r[1]) << 64) | r[0];
 }
 
-// Fixed-size limb arithmetic for an N-limb integer, instantiated at comptime for
-// each modulus size. The arithmetic operates on a single CRT prime (half the
-// modulus): N = 16 for RSA-2048, 24 for RSA-3072, 32 for RSA-4096. With N a
-// compile-time constant every `inline for (0..N)` fully unrolls, so each
-// instantiation is exactly the specialized code that a hand-written, size-fixed
-// version would produce.
+// Fixed-size math on N 64-bit limbs, lowest limb first.
+// Signing uses it at half the modulus size (one CRT prime), and verify at full size.
 pub fn BigInt(comptime N: usize) type {
     return struct {
         pub const limbs = N;
-        pub const Fe = [N]Limb; // a field element / N-limb integer
+        pub const Fe = [N]Limb;
         pub const zero: Fe = @splat(0);
         pub const one: Fe = blk: {
             var o: Fe = @splat(0);
@@ -53,9 +48,7 @@ pub fn BigInt(comptime N: usize) type {
             break :blk o;
         };
 
-        // Big-endian bytes (at most N limbs wide) into little-endian limbs. The
-        // caller guarantees be.len <= 8*N; shorter inputs are right-aligned, so
-        // leading-zero-trimmed values still land in the low limbs.
+        // Shorter inputs are treated as having leading zeros.
         pub fn fromBytesBE(be: []const u8) Fe {
             std.debug.assert(be.len <= 8 * N);
             var bytes: [8 * N]u8 = @splat(0);
@@ -67,7 +60,6 @@ pub fn BigInt(comptime N: usize) type {
             return fe;
         }
 
-        // Little-endian limbs into big-endian bytes (I2OSP).
         pub fn toBytesBE(a: *const Fe) [8 * N]u8 {
             var bytes: [8 * N]u8 = undefined;
             for (0..N) |i| {
@@ -76,7 +68,7 @@ pub fn BigInt(comptime N: usize) type {
             return bytes;
         }
 
-        // R^2 mod m with R = 2^(64*N): start at 1 and double mod m 2*64*N times.
+        // R^2 mod m (R = 2^(64*N)), used to put values in Montgomery form.
         pub fn rSquared(m: *const Fe) Fe {
             var acc: Fe = zero;
             acc[0] = 1;
@@ -122,8 +114,7 @@ pub fn BigInt(comptime N: usize) type {
                 r[i] = @truncate(s);
                 carry = @intCast(s >> 64);
             }
-            // Sum may be N+1 limbs (carry out). value = carry*R + r < 2m, so subtract
-            // m when there is a carry OR the low part already exceeds m.
+            // Don't ignore the carry: if the sum overflowed, it's already above m.
             if (carry != 0 or geq(&r, m)) subInPlace(&r, m);
             return r;
         }
@@ -147,14 +138,13 @@ pub fn BigInt(comptime N: usize) type {
             return r;
         }
 
-        // CIOS Montgomery multiplication: returns a*b*R^{-1} mod m, with R = 2^(64*N).
+        // a * b * R^-1 mod m, with a and b both below m.
         pub fn montMul(a: *const Fe, b: *const Fe, m: *const Fe, n0inv: Limb) Fe {
             @setEvalBranchQuota(20000);
             var t: [N + 1]Limb = @splat(0);
-            var tn: Limb = 0; // t[N]
+            var tn: Limb = 0; // top limb of t
             for (0..N) |i| {
                 const ai = a[i];
-                // t += a[i] * b
                 var c: Limb = 0;
                 inline for (0..N) |j| {
                     const prod = mulWide(ai, b[j]) + @as(Wide, t[j]) + @as(Wide, c);
@@ -164,7 +154,7 @@ pub fn BigInt(comptime N: usize) type {
                 const s0 = @as(Wide, tn) + @as(Wide, c);
                 const tcarry: Limb = @intCast(s0 >> 64);
 
-                // m_hat = t[0] * n0inv mod 2^64; t = (t + m_hat*m) / 2^64
+                // Add the multiple of m that zeroes the low limb, then drop that limb.
                 const mh: Limb = t[0] *% n0inv;
                 var c2: Limb = @intCast((mulWide(mh, m[0]) + @as(Wide, t[0])) >> 64);
                 inline for (1..N) |j| {
@@ -177,16 +167,16 @@ pub fn BigInt(comptime N: usize) type {
                 tn = tcarry + @as(Limb, @intCast(s1 >> 64));
             }
             var r: Fe = t[0..N].*;
-            // result < 2m; one conditional subtraction (tn is 0 or 1)
+            // The result is below 2m, so one subtraction is enough.
             if (tn != 0 or geq(&r, m)) subInPlace(&r, m);
             return r;
         }
 
-        // Squaring with the i<j symmetry: ~N^2/2 limb products instead of N^2.
+        // Same as mulFull(a, a), with about half the multiplies.
+        // Each cross product a[i]*a[j] is computed once and doubled.
         pub fn sqrFull(a: *const Fe) [2 * N]Limb {
             @setEvalBranchQuota(20000);
             var r: [2 * N]Limb = @splat(0);
-            // off-diagonal sum_{i<j} a[i]*a[j]
             inline for (0..N) |i| {
                 var c: Limb = 0;
                 const ai = a[i];
@@ -197,14 +187,12 @@ pub fn BigInt(comptime N: usize) type {
                 }
                 r[i + N] = c;
             }
-            // double the off-diagonal part
             var carry: Limb = 0;
             inline for (0..2 * N) |i| {
                 const nc = r[i] >> 63;
                 r[i] = (r[i] << 1) | carry;
                 carry = nc;
             }
-            // add the diagonal a[i]^2
             var c2: Wide = 0;
             inline for (0..N) |i| {
                 const sq = mulWide(a[i], a[i]);
@@ -217,7 +205,7 @@ pub fn BigInt(comptime N: usize) type {
             return r;
         }
 
-        // Montgomery reduction of a 2N-limb value: returns T * R^{-1} mod m in [0, m).
+        // T * R^-1 mod m, for any T below m*R, like the square of a number below m.
         pub fn redc(tin: *const [2 * N]Limb, m: *const Fe, n0inv: Limb) Fe {
             @setEvalBranchQuota(20000);
             var t: [2 * N + 1]Limb = undefined;
@@ -231,7 +219,6 @@ pub fn BigInt(comptime N: usize) type {
                     t[i + j] = @truncate(prod);
                     c = @intCast(prod >> 64);
                 }
-                // propagate carry c through the upper words
                 var k: usize = i + N;
                 while (c != 0) : (k += 1) {
                     const s = @as(Wide, t[k]) + @as(Wide, c);
@@ -249,7 +236,6 @@ pub fn BigInt(comptime N: usize) type {
             return redc(&s, m, n0inv);
         }
 
-        // Full schoolbook multiply: (a[N]) * (b[N]) -> r[2N]
         pub fn mulFull(a: *const Fe, b: *const Fe) [2 * N]Limb {
             var r: [2 * N]Limb = @splat(0);
             for (0..N) |i| {
@@ -265,4 +251,18 @@ pub fn BigInt(comptime N: usize) type {
             return r;
         }
     };
+}
+
+// Native builds never use mul64Portable, so test it directly.
+test "mul64Portable matches the 128-bit product" {
+    var prng: std.Random.DefaultPrng = .init(0);
+    var values: [64]Limb = undefined;
+    for (&values) |*v| v.* = prng.random().int(Limb);
+    values[0..4].* = .{ 0, 1, 0xffff_ffff, std.math.maxInt(Limb) };
+    for (values) |a| {
+        for (values) |b| {
+            const w = @as(Wide, a) * @as(Wide, b);
+            try std.testing.expectEqual([2]Limb{ @truncate(w), @intCast(w >> 64) }, mul64Portable(a, b));
+        }
+    }
 }
