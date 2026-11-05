@@ -169,14 +169,14 @@ pub fn Rsa(comptime modulus_bits: usize) type {
             var s: [2 * N]u64 = qh;
             var carry: u128 = 0;
             for (0..N) |i| {
-                const t = @as(u128, s[i]) + @as(u128, sq[i]) + carry;
+                const t = @as(u128, s[i]) + sq[i] + carry;
                 s[i] = @truncate(t);
                 carry = t >> 64;
             }
             // In constant-time mode, go through every limb, even once the carry is zero.
             var i: usize = N;
             while (i < 2 * N and (std.options.side_channels_mitigations != .none or carry != 0)) : (i += 1) {
-                const t = @as(u128, s[i]) + carry;
+                const t = s[i] + carry;
                 s[i] = @truncate(t);
                 carry = t >> 64;
             }
