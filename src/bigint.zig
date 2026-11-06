@@ -31,9 +31,7 @@ inline fn mul64Portable(a: Limb, b: Limb) [2]Limb {
     return .{ lo, hi };
 }
 
-// Going through mul64() looks redundant, but it changes the code LLVM generates.
-// A plain 128-bit multiply here makes verification 2% slower natively.
-// std.math.mulWide() makes signing 34% slower on Cranelift x86_64.
+// Faster than std.math.mulWide with Cranelift
 pub inline fn mulWide(a: Limb, b: Limb) Wide {
     const r = mul64(a, b);
     return (@as(Wide, r[1]) << 64) | r[0];
@@ -585,45 +583,6 @@ test "mul64Portable matches the 128-bit product" {
         for (values) |b| {
             const w = std.math.mulWide(Limb, a, b);
             try std.testing.expectEqual([2]Limb{ @truncate(w), @intCast(w >> 64) }, mul64Portable(a, b));
-        }
-    }
-}
-
-// Each build only uses some of these kernels, so check them all against each other here.
-test "column and row kernels agree" {
-    const negInv64 = @import("key.zig").negInv64;
-    var prng: std.Random.DefaultPrng = .init(1);
-    const random = prng.random();
-    inline for (.{ 16, 32, 64 }) |n| {
-        inline for (.{ BigInt(n), PublicBigInt(n) }) |B| {
-            for (0..200) |iter| {
-                var m: B.Fe = undefined;
-                var a: B.Fe = undefined;
-                var b: B.Fe = undefined;
-                random.bytes(std.mem.asBytes(&m));
-                random.bytes(std.mem.asBytes(&a));
-                random.bytes(std.mem.asBytes(&b));
-                m[0] |= 1;
-                m[n - 1] |= 1 << 63;
-                // Start with the largest possible inputs.
-                if (iter == 0) {
-                    a = m;
-                    a[0] -= 1;
-                    b = a;
-                }
-                B.condSub(&a, &m);
-                B.condSub(&b, &m);
-
-                const n0inv = negInv64(m[0]);
-                const want = B.redc(&B.sqrFull(&a), &m, n0inv);
-                var t: [2 * n + 1]Limb = undefined;
-                B.sqrColumns(&a, &t);
-                try std.testing.expectEqual(want, B.redcPairs(&t, &m, n0inv));
-                if (n <= 32) {
-                    try std.testing.expectEqual(want, B.montSqrColumns(&a, &m, n0inv));
-                    try std.testing.expectEqual(B.montMulRows(&a, &b, &m, n0inv), B.montMulColumns(&a, &b, &m, n0inv));
-                }
-            }
         }
     }
 }

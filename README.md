@@ -1,42 +1,58 @@
+# rsa-wasm
 
-# RSA-4096 signing benchmarks
+RSA PKCS#1 v1.5 signatures with SHA-256, written in Zig, and tuned for WebAssembly with the wide-arithmetic extension.
 
-PKCS#1 v1.5 signatures over SHA-256 with a 4096-bit key. Every implementation
-produces the same signature bytes; the only thing that varies is how fast it
-gets there. The Wasm rows run under Wasmtime with precompiled modules.
+It supports 2048, 3072 and 4096-bit keys.
+The size is picked at build time with `-Dbits=N` (default 4096), so each build is fully specialized for it.
 
-The signer is parametric over the modulus size: 2048, 3072 and 4096 bits all
-work, selected at build time with `-Dbits=N` (default 4096). The size is a
-comptime parameter, so each build is fully specialized — the 4096-bit path
-compiles to exactly the same code it did before the other sizes existed. The
-benchmark numbers below are all for the 4096-bit key.
+## Benchmarks
 
-## Apple Silicon M5 (aarch64)
+`BENCHMARK-RSA4096.md` compares RSA-4096 signing and verification with the Rust `rsa` crate (0.10), zig-rsa and OpenSSL.
 
-| Implementation                | ms/sign | vs OpenSSL native |
-| ----------------------------- | ------- | ----------------- |
-| OpenSSL native (asm)          | 1.93    | 1.00x             |
-| BoringSSL native (asm)        | 2.05    | 1.06× slower      |
-| Zig native                    | 3.21    | 1.66× slower      |
-| Zig wasm — wide-arithmetic    | 3.43    | 1.78× slower      |
-| Zig wasm — no wide-arithmetic | 8.32    | 4.31× slower      |
-| BoringSSL wasm (precompiled)  | 13.98   | 7.24× slower      |
-| Rust `rsa` 0.9.10 wasm        | 20.00   | 10.4× slower      |
-| Rust `rsa` 0.10 wasm          | 21.79   | 11.3× slower      |
-| OpenSSL 3 wasm (precompiled)  | 38.65   | 20.0× slower      |
+They run on an Apple M5 Max and on an AMD Ryzen 7 7700 with boost turned off.
+OpenSSL runs natively, and the others run natively and on wasm, with wasmer's Cranelift and LLVM backends.
 
-## Linux/x86_64 (AMD Zen 5)
+Signing, in ms, with wide arithmetic on wasm:
 
-Rerun on an AMD Ryzen AI 9 HX 470 (Zen 5) under Linux, again with Wasmtime and
-precompiled modules. Frequency boost was disabled and the CPU was capped at
-2.0 GHz on this host, so the absolute times run much higher than the M5 numbers
-above and the two machines are not directly comparable. What is comparable is
-the spread between implementations, and here it is far wider.
+```
++---------+------------------+----------------+-------------+----------------+-------------+----------------+
+| host    | runtime          | rsa-wasm no-ct | rsa-wasm ct | rsa 0.10 no-ct | rsa 0.10 ct | OpenSSL ct     |
++---------+------------------+----------------+-------------+----------------+-------------+----------------+
+| aarch64 | native           |           2.03 |        2.26 |           3.88 |        5.47 |           1.82 |
+| aarch64 | wasmer cranelift |           2.17 |        2.43 |           5.35 |        7.48 |              - |
+| aarch64 | wasmer llvm      |           2.29 |        2.46 |           5.11 |        7.09 |              - |
+| x86_64  | native           |           4.69 |        5.11 |           9.26 |       12.69 | 1.39 (3.88)    |
+| x86_64  | wasmer cranelift |           5.02 |        5.92 |          11.73 |       16.26 |              - |
+| x86_64  | wasmer llvm      |           5.24 |        6.10 |          12.28 |       16.73 |              - |
++---------+------------------+----------------+-------------+----------------+-------------+----------------+
+```
 
-| Implementation             | ms/sign | vs OpenSSL native |
-| -------------------------- | ------- | ----------------- |
-| OpenSSL native (asm)       | 2.72    | 1.00x             |
-| Zig wasm — wide-arithmetic | 11.30   | 4.15× slower      |
-| Rust `rsa` 0.9.10 wasm     | 106.57  | 39.2× slower      |
-| Rust `rsa` 0.10 wasm       | 106.57  | 39.2× slower      |
+On x86_64, OpenSSL uses AVX-512 IFMA, and the number in parentheses is without it.
 
+"ct" means with side-channel mitigations: constant-time code for rsa-wasm, blinding for rsa 0.10, and both for OpenSSL.
+rsa 0.10 is always constant time, so its "no-ct" column is constant time without blinding.
+
+## Constant-time signing
+
+By default, signing doesn't run in constant time, so that it's as fast as possible.
+To make it constant time:
+
+```sh
+zig build -Dside-channels-mitigations=medium   # any level other than none
+```
+
+At 4096 bits, that costs 7 to 12% on the M5, and 7 to 18% on the Ryzen, depending on the runtime.
+
+`tmp/ct/` has the checks that signing really runs in constant time.
+
+## How it's fast
+
+Natively and on wasm with wide arithmetic, Montgomery multiplication and squaring compute the product one column at a time, and reduce in the same columns.
+That's used up to 32 limbs, which covers signing with every key size, and verification with 2048-bit keys.
+Verification with larger keys also squares by columns, but reduces row by row.
+
+The code is fully unrolled for each key size, and written so that Cranelift doesn't have to spill the intermediate values.
+
+Without wide arithmetic, simpler row-by-row code is used, because it's faster there.
+
+`findings.md` explains how this works, and what else was tried.
